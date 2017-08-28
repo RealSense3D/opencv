@@ -47,6 +47,7 @@
 #include <iostream>
 #include <sstream>
 #include <iterator>
+#include <numeric>
 #include <opencv2/dnn/shape_utils.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -464,29 +465,34 @@ public:
         }
     }
 
-    void reuseOrCreate(const MatShape& shape, const LayerPin& lp, Mat& dst)
+    void reuseOrCreate(const MatShape& shape, const LayerPin& lp, Mat& dst, bool force)
     {
-        std::map<LayerPin, Mat>::iterator hostIt;
-        std::map<LayerPin, int>::iterator refIt;
-
-        const int targetTotal = total(shape);
         Mat bestBlob;
-        int bestBlobTotal = INT_MAX;
         LayerPin bestBlobPin;
-        for (hostIt = memHosts.begin(); hostIt != memHosts.end(); ++hostIt)
+
+        if( !force )
         {
-            refIt = refCounter.find(hostIt->first);
-            // Use only blobs that had references before because if not,
-            // it might be used as output.
-            if (refIt != refCounter.end() && refIt->second == 0)
+            std::map<LayerPin, Mat>::iterator hostIt;
+            std::map<LayerPin, int>::iterator refIt;
+
+            const int targetTotal = total(shape);
+            int bestBlobTotal = INT_MAX;
+
+            for (hostIt = memHosts.begin(); hostIt != memHosts.end(); ++hostIt)
             {
-                Mat& unusedBlob = hostIt->second;
-                if (unusedBlob.total() >= targetTotal &&
-                    unusedBlob.total() < bestBlobTotal)
+                refIt = refCounter.find(hostIt->first);
+                // Use only blobs that had references before because if not,
+                // it might be used as output.
+                if (refIt != refCounter.end() && refIt->second == 0)
                 {
-                    bestBlobPin = hostIt->first;
-                    bestBlob = unusedBlob;
-                    bestBlobTotal = unusedBlob.total();
+                    Mat& unusedBlob = hostIt->second;
+                    if (unusedBlob.total() >= targetTotal &&
+                        unusedBlob.total() < bestBlobTotal)
+                    {
+                        bestBlobPin = hostIt->first;
+                        bestBlob = unusedBlob;
+                        bestBlobTotal = unusedBlob.total();
+                    }
                 }
             }
         }
@@ -505,7 +511,8 @@ public:
     }
 
     void allocateBlobsForLayer(LayerData &ld, const LayerShapes& layerShapes,
-                               std::vector<LayerPin>& pinsForInternalBlobs)
+                               std::vector<LayerPin>& pinsForInternalBlobs,
+                               bool maximizeReuse)
     {
         CV_TRACE_FUNCTION();
 
@@ -561,6 +568,7 @@ public:
         }
 
         std::map<int, std::vector<int> >::reverse_iterator it;
+        bool force = !maximizeReuse && ld.inputBlobsId.size() > 1;
         for(it = idxSizes.rbegin(); it != idxSizes.rend(); it++)
         {
             for(int j = 0; j < it->second.size(); j++)
@@ -569,7 +577,7 @@ public:
                 if (total(shapes[index]))
                 {
                     LayerPin blobPin(ld.id, index);
-                    if (index < outShapes.size() && inPlace)
+                    if (index < outShapes.size() && inPlace && !force)
                     {
                         CV_Assert(ld.inputBlobs[0]->total() == total(shapes[index]));
                         ld.outputBlobs[index] = ld.inputBlobs[0]->reshape(1, shapes[index]);
@@ -577,7 +585,7 @@ public:
                     }
                     else
                     {
-                        reuseOrCreate(shapes[index], blobPin, *blobs[index]);
+                        reuseOrCreate(shapes[index], blobPin, *blobs[index], force);
                     }
                 }
             }
@@ -626,8 +634,9 @@ struct Net::Impl
         inpl.layerInstance = netInputLayer;
         layerNameToId.insert(std::make_pair(inpl.name, inpl.id));
 
-        lastLayerId = 1;
+        lastLayerId = 0;
         netWasAllocated = false;
+        fusion = true;
         preferableBackend = DNN_BACKEND_DEFAULT;
         preferableTarget = DNN_TARGET_CPU;
     }
@@ -647,6 +656,8 @@ struct Net::Impl
     int lastLayerId;
 
     bool netWasAllocated;
+    bool fusion;
+    std::vector<int64> layersTimings;
 
     void compileHalide()
     {
@@ -685,6 +696,7 @@ struct Net::Impl
         for (it = layers.begin(); it != layers.end(); it++)
         {
             if (it->second.id != 0) {
+                it->second.inputBlobs.clear();
                 it->second.outputBlobs.clear();
                 it->second.internals.clear();
             }
@@ -695,8 +707,7 @@ struct Net::Impl
             if( currLayer.empty() )
                 continue;
 
-            currLayer->setActivation(Ptr<ActivationLayer>());
-            currLayer->setBatchNorm(Ptr<BatchNormLayer>());
+            currLayer->unsetAttached();
 
             Ptr<PoolingLayer> poolingLayer = currLayer.dynamicCast<PoolingLayer>();
             if( !poolingLayer.empty() )
@@ -704,8 +715,12 @@ struct Net::Impl
                 poolingLayer->computeMaxIdx = true;
             }
         }
-    }
+        it = layers.find(0);
+        CV_Assert(it != layers.end());
+        it->second.skipFlags[DNN_BACKEND_DEFAULT] = true;
 
+        layersTimings.clear();
+    }
 
     void setUpNet(const std::vector<LayerPin>& blobsToKeep_ = std::vector<LayerPin>())
     {
@@ -783,13 +798,11 @@ struct Net::Impl
 
     LayerData& getLayerData(const DictValue &layerDesc)
     {
+        CV_Assert(layerDesc.isInt() || layerDesc.isString());
         if (layerDesc.isInt())
             return getLayerData(layerDesc.get<int>());
-        else if (layerDesc.isString())
+        else /*if (layerDesc.isString())*/
             return getLayerData(layerDesc.get<String>());
-
-        CV_Assert(layerDesc.isInt() || layerDesc.isString());
-        return *((LayerData*)NULL);
     }
 
     static void addLayerInput(LayerData &ld, int inNum, LayerPin from)
@@ -969,9 +982,6 @@ struct Net::Impl
         }
     }
 
-    #define CV_RETHROW_ERROR(err, newmsg)\
-        cv::error(err.code, newmsg, err.func.c_str(), err.file.c_str(), err.line)
-
     void allocateLayer(int lid, const LayersShapesMap& layersShapes)
     {
         CV_TRACE_FUNCTION();
@@ -1024,7 +1034,8 @@ struct Net::Impl
         CV_Assert(layerShapesIt != layersShapes.end());
 
         std::vector<LayerPin> pinsForInternalBlobs;
-        blobManager.allocateBlobsForLayer(ld, layerShapesIt->second, pinsForInternalBlobs);
+        bool maximizeReuse = preferableBackend == DNN_BACKEND_HALIDE;
+        blobManager.allocateBlobsForLayer(ld, layerShapesIt->second, pinsForInternalBlobs, maximizeReuse);
 
         Ptr<Layer> layerPtr = ld.getLayerInstance();
         {
@@ -1047,8 +1058,17 @@ struct Net::Impl
         ld.flag = 1;
     }
 
+#if 0
+#define printf_(args) printf args
+#else
+#define printf_(args)
+#endif
+
     void fuseLayers(const std::vector<LayerPin>& blobsToKeep_)
     {
+        if( !fusion || preferableBackend == DNN_BACKEND_HALIDE )
+            return;
+
         CV_TRACE_FUNCTION();
 
         // scan through all the layers. If there is convolution layer followed by the activation layer,
@@ -1063,11 +1083,17 @@ struct Net::Impl
             LayerData& ld = layers[lid];
             if( ld.skipFlags[DNN_BACKEND_DEFAULT] )
             {
+                printf_(("skipped %s: %s\n", ld.layerInstance->name.c_str(), ld.layerInstance->type.c_str()));
                 continue;
             }
+            printf_(("analyzing %s: %s\n", ld.layerInstance->name.c_str(), ld.layerInstance->type.c_str()));
             if( ld.consumers.size() == 0 )
                 outnames.push_back(ld.layerInstance->name);
 
+            // the optimization #1. try to fuse batch norm, scaling and/or activation layers
+            // with the current layer if they follow it. Normally, the are fused with the convolution layer,
+            // but some of them (like activation) may be fused with fully-connected, elemwise (+) and
+            // some other layers.
             Ptr<Layer>& currLayer = ld.layerInstance;
             if( ld.consumers.size() == 1 && pinsToKeep.count(LayerPin(lid, 0)) == 0 )
             {
@@ -1081,10 +1107,34 @@ struct Net::Impl
                     nextData = 0;
                     if( currLayer->setBatchNorm(nextBNormLayer) )
                     {
+                        printf_(("\tfused with %s\n", nextBNormLayer->name.c_str()));
                         bnormData->skipFlags[DNN_BACKEND_DEFAULT] = true;
                         ld.outputBlobs = layers[lpNext.lid].outputBlobs;
                         if( bnormData->consumers.size() == 1 )
+                        {
                             nextData = &layers[bnormData->consumers[0].lid];
+                            lpNext = LayerPin(bnormData->consumers[0].lid, 0);
+                        }
+                    }
+                }
+
+                Ptr<ScaleLayer> nextScaleLayer;
+                if( nextData )
+                    nextScaleLayer = nextData->layerInstance.dynamicCast<ScaleLayer>();
+                if( !nextScaleLayer.empty() && pinsToKeep.count(lpNext) == 0 )
+                {
+                    LayerData* scaleData = nextData;
+                    nextData = 0;
+                    if( currLayer->setScale(nextScaleLayer) )
+                    {
+                        printf_(("\tfused with %s\n", nextScaleLayer->name.c_str()));
+                        scaleData->skipFlags[DNN_BACKEND_DEFAULT] = true;
+                        ld.outputBlobs = layers[lpNext.lid].outputBlobs;
+                        if( scaleData->consumers.size() == 1 )
+                        {
+                            nextData = &layers[scaleData->consumers[0].lid];
+                            lpNext = LayerPin(scaleData->consumers[0].lid, 0);
+                        }
                     }
                 }
 
@@ -1092,13 +1142,19 @@ struct Net::Impl
                 if( nextData )
                     nextActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
 
-                if( !nextActivLayer.empty() && currLayer->setActivation(nextActivLayer) )
+                if( !nextActivLayer.empty() && pinsToKeep.count(lpNext) == 0
+                        && currLayer->setActivation(nextActivLayer) )
                 {
-                    //printf("successfully merged %s and %s\n", currLayer->name.c_str(), nextActivLayer->name.c_str());
+                    printf_(("\tfused with %s\n", nextActivLayer->name.c_str()));
                     nextData->skipFlags[DNN_BACKEND_DEFAULT] = true;
                     ld.outputBlobs = layers[lpNext.lid].outputBlobs;
                 }
             }
+
+            // the optimization #2. if there is no layer that takes max pooling layer's computed
+            // max indices (and only some semantical segmentation networks might need this;
+            // many others only take the maximum values), then we switch the max pooling
+            // layer to the faster operating mode.
             Ptr<PoolingLayer> poolingLayer = ld.layerInstance.dynamicCast<PoolingLayer>();
             if( !poolingLayer.empty() && !ld.consumers.empty() )
             {
@@ -1111,7 +1167,71 @@ struct Net::Impl
                 if( i >= nconsumers )
                 {
                     poolingLayer->computeMaxIdx = false;
-                    //printf("simplified pooling layer %s\n", poolingLayer->name.c_str());
+                    printf_(("\tsimplified pooling layer %s\n", poolingLayer->name.c_str()));
+                }
+            }
+
+            // the optimization #3. if there is concat layer that concatenates channels
+            // from the inputs together (i.e. axis == 1) then we make the inputs of
+            // the concat layer to write to the concatetion output buffer
+            // (and so we eliminate the concatenation layer, because the channels
+            // are concatenated implicitly).
+            Ptr<ConcatLayer> concatLayer = ld.layerInstance.dynamicCast<ConcatLayer>();
+            if( !concatLayer.empty() && concatLayer->axis == 1 &&
+                ld.outputBlobs.size() == 1 )
+            {
+                Mat& output = ld.outputBlobs[0];
+
+                // TODO: in general, this optimization can always be done, but
+                // many layers currently check that the input/output blobs are
+                // continuous arrays. Unfortunately, this is not true when
+                // the concatenation optimization is applied with batch_size > 1.
+                // so, for now, we only apply this optimization in the most popular
+                // case batch_size == 1.
+                if( output.dims == 4 && output.size[0] == 1 )
+                {
+                    size_t i, ninputs = ld.inputBlobsId.size();
+                    std::vector<LayerPin> realinputs(ninputs);
+                    for( i = 0; i < ninputs; i++ )
+                    {
+                        LayerPin pin = ld.inputBlobsId[i];
+                        LayerData* inp_i_data = &layers[pin.lid];
+                        while(inp_i_data->skipFlags[DNN_BACKEND_DEFAULT] &&
+                              inp_i_data->inputBlobsId.size() == 1)
+                        {
+                            pin = inp_i_data->inputBlobsId[0];
+                            inp_i_data = &layers[pin.lid];
+                        }
+                        printf_(("\treal input for %s is %s\n",
+                               layers[ld.inputBlobsId[i].lid].getLayerInstance()->name.c_str(),
+                               inp_i_data->getLayerInstance()->name.c_str()));
+
+                        if(inp_i_data->skipFlags[DNN_BACKEND_DEFAULT])
+                            break;
+                        realinputs[i] = pin;
+                    }
+
+                    if( i >= ninputs )
+                    {
+                        Range chrange[] = { Range::all(), Range::all(), Range::all(), Range::all() };
+                        int ofs = 0;
+                        for( i = 0; i < ninputs; i++ )
+                        {
+                            LayerPin pin = realinputs[i];
+                            LayerData* inp_i_data = &layers[pin.lid];
+                            int channels_i = ld.inputBlobs[i]->size[1];
+                            chrange[1] = Range(ofs, ofs + channels_i);
+                            printf_(("\toutput %s(%d) to channels (%d, %d)\n", inp_i_data->layerInstance->name.c_str(),
+                                   pin.oid, ofs, ofs + channels_i));
+                            ofs += channels_i;
+                            Mat output_slice = output(chrange);
+                            Mat& curr_output = inp_i_data->outputBlobs[pin.oid];
+                            CV_Assert(output_slice.isContinuous() && output_slice.size == curr_output.size);
+                            curr_output = output_slice;
+                        }
+                        ld.skipFlags[DNN_BACKEND_DEFAULT] = true;
+                        printf_(("\toptimized out Concat layer %s\n", concatLayer->name.c_str()));
+                    }
                 }
             }
         }
@@ -1153,6 +1273,8 @@ struct Net::Impl
             allocateLayer(lid, layersShapes);
         }
 
+        layersTimings.resize(lastLayerId + 1, 0);
+
         fuseLayers(blobsToKeep_);
     }
 
@@ -1162,11 +1284,16 @@ struct Net::Impl
 
         Ptr<Layer> layer = ld.layerInstance;
 
+        TickMeter tm;
+        tm.start();
+
         if (preferableBackend == DNN_BACKEND_DEFAULT ||
             !layer->supportBackend(preferableBackend))
         {
             if( !ld.skipFlags[DNN_BACKEND_DEFAULT] )
                 layer->forward(ld.inputBlobs, ld.outputBlobs, ld.internals);
+            else
+                tm.reset();
         }
         else if (!ld.skipFlags[preferableBackend])
         {
@@ -1182,6 +1309,9 @@ struct Net::Impl
                 CV_Error(Error::StsNotImplemented, "Unknown backend identifier");
             }
         }
+
+        tm.stop();
+        layersTimings[ld.id] = tm.getTimeTicks();
 
         ld.flag = 1;
     }
@@ -1461,9 +1591,12 @@ void Net::setPreferableBackend(int backendId)
     CV_TRACE_FUNCTION();
     CV_TRACE_ARG(backendId);
 
-    impl->netWasAllocated = impl->netWasAllocated &&
-                            impl->preferableBackend == backendId;
-    impl->preferableBackend = backendId;
+    if( impl->preferableBackend != backendId )
+    {
+        impl->preferableBackend = backendId;
+        impl->netWasAllocated = false;
+        impl->clear();
+    }
 }
 
 void Net::setPreferableTarget(int targetId)
@@ -1471,9 +1604,12 @@ void Net::setPreferableTarget(int targetId)
     CV_TRACE_FUNCTION();
     CV_TRACE_ARG(targetId);
 
-    impl->netWasAllocated = impl->netWasAllocated &&
-                            impl->preferableTarget == targetId;
-    impl->preferableTarget = targetId;
+    if( impl->preferableTarget != targetId )
+    {
+        impl->preferableTarget = targetId;
+        impl->netWasAllocated = false;
+        impl->clear();
+    }
 }
 
 void Net::setInputsNames(const std::vector<String> &inputBlobNames)
@@ -1595,16 +1731,13 @@ std::vector<int> Net::getUnconnectedOutLayers() const
 }
 
 void Net::getLayersShapes(const ShapesVec& netInputShapes,
-                          std::vector<int>* layersIds,
-                          std::vector<ShapesVec>* inLayersShapes,
-                          std::vector<ShapesVec>* outLayersShapes) const
+                          std::vector<int>& layersIds,
+                          std::vector<ShapesVec>& inLayersShapes,
+                          std::vector<ShapesVec>& outLayersShapes) const
 {
-    if ((layersIds || inLayersShapes || outLayersShapes) == false)
-        return;
-
-    if (layersIds) layersIds->clear();
-    if (inLayersShapes) inLayersShapes->clear();
-    if (outLayersShapes) outLayersShapes->clear();
+    layersIds.clear();
+    inLayersShapes.clear();
+    outLayersShapes.clear();
 
     Impl::LayersShapesMap inOutShapes;
     impl->getLayersShapes(netInputShapes, inOutShapes);
@@ -1612,19 +1745,16 @@ void Net::getLayersShapes(const ShapesVec& netInputShapes,
     for(Impl::LayersShapesMap::const_iterator it = inOutShapes.begin();
         it != inOutShapes.end(); it++)
     {
-        if (layersIds)
-            layersIds->push_back(it->first);
-        if (inLayersShapes)
-            inLayersShapes->push_back(it->second.in);
-        if (outLayersShapes)
-            outLayersShapes->push_back(it->second.out);
+        layersIds.push_back(it->first);
+        inLayersShapes.push_back(it->second.in);
+        outLayersShapes.push_back(it->second.out);
     }
 }
 
 void Net::getLayersShapes(const MatShape& netInputShape,
-                          std::vector<int>* layerIds,
-                          std::vector<ShapesVec>* inLayersShapes,
-                          std::vector<ShapesVec>* outLayersShapes) const
+                          std::vector<int>& layerIds,
+                          std::vector<ShapesVec>& inLayersShapes,
+                          std::vector<ShapesVec>& outLayersShapes) const
 {
     getLayersShapes(ShapesVec(1, netInputShape),
                     layerIds, inLayersShapes, outLayersShapes);
@@ -1632,8 +1762,8 @@ void Net::getLayersShapes(const MatShape& netInputShape,
 
 void Net::getLayerShapes(const MatShape& netInputShape,
                          const int layerId,
-                         ShapesVec* inLayerShapes,
-                         ShapesVec* outLayerShapes) const
+                         ShapesVec& inLayerShapes,
+                         ShapesVec& outLayerShapes) const
 {
     getLayerShapes(ShapesVec(1, netInputShape),
                    layerId, inLayerShapes, outLayerShapes);
@@ -1642,15 +1772,13 @@ void Net::getLayerShapes(const MatShape& netInputShape,
 
 void Net::getLayerShapes(const ShapesVec& netInputShapes,
                     const int layerId,
-                    ShapesVec* inLayerShapes,
-                    ShapesVec* outLayerShapes) const
+                    ShapesVec& inLayerShapes,
+                    ShapesVec& outLayerShapes) const
 {
     LayerShapes shapes;
     impl->getLayerShapes(netInputShapes, layerId, shapes);
-    if (inLayerShapes)
-        *inLayerShapes = shapes.in;
-    if (outLayerShapes)
-        *outLayerShapes = shapes.out;
+    inLayerShapes = shapes.in;
+    outLayerShapes = shapes.out;
 }
 
 int64 Net::getFLOPS(const std::vector<MatShape>& netInputShapes) const
@@ -1660,7 +1788,7 @@ int64 Net::getFLOPS(const std::vector<MatShape>& netInputShapes) const
     int64 flops = 0;
     std::vector<int> ids;
     std::vector<std::vector<MatShape> > inShapes, outShapes;
-    getLayersShapes(netInputShapes, &ids, &inShapes, &outShapes);
+    getLayersShapes(netInputShapes, ids, inShapes, outShapes);
     CV_Assert(inShapes.size() == outShapes.size());
     CV_Assert(inShapes.size() == ids.size());
 
@@ -1745,8 +1873,8 @@ void Net::getMemoryConsumption(const int layerId,
         weights += weightsBlob.total()*weightsBlob.elemSize();
     }
 
-    std::vector<MatShape> outLayerShapes;
-    getLayerShapes(netInputShapes, layerId, 0, &outLayerShapes);
+    ShapesVec inLayerShapes, outLayerShapes;
+    getLayerShapes(netInputShapes, layerId, inLayerShapes, outLayerShapes);
     for(int i = 0; i < outLayerShapes.size(); i++)
     {
         blobs += total(outLayerShapes[i]) * sizeof(float);
@@ -1795,9 +1923,9 @@ void Net::getMemoryConsumption(const std::vector<MatShape>& netInputShapes,
     weights.clear();
     blobs.clear();
 
-    std::vector<std::vector<MatShape> > outLayerShapes;
+    std::vector<std::vector<MatShape> > inLayerShapes, outLayerShapes;
 
-    getLayersShapes(netInputShapes, &layerIds, 0, &outLayerShapes);
+    getLayersShapes(netInputShapes, layerIds, inLayerShapes, outLayerShapes);
 
     for(int i = 0; i < layerIds.size(); i++)
     {
@@ -1828,12 +1956,29 @@ void Net::getMemoryConsumption(const MatShape& netInputShape, std::vector<int>& 
                          weights, blobs);
 }
 
+void Net::enableFusion(bool fusion)
+{
+    if( impl->fusion != fusion )
+    {
+        impl->fusion = fusion;
+        impl->netWasAllocated = false;
+        impl->clear();
+    }
+}
+
 void Net::setHalideScheduler(const String& scheduler)
 {
     CV_TRACE_FUNCTION();
     CV_TRACE_ARG_VALUE(scheduler, "scheduler", scheduler.c_str());
 
     impl->halideConfigFile = scheduler;
+}
+
+int64 Net::getPerfProfile(std::vector<double>& timings)
+{
+    timings = std::vector<double>(impl->layersTimings.begin() + 1, impl->layersTimings.end());
+    int64 total = std::accumulate(timings.begin(), timings.end(), 0);
+    return total;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -1953,6 +2098,13 @@ Ptr<BackendNode> Layer::tryAttach(const Ptr<BackendNode>& node)
 
 bool Layer::setActivation(const Ptr<ActivationLayer>&) { return false; }
 bool Layer::setBatchNorm(const Ptr<BatchNormLayer>&) { return false; }
+bool Layer::setScale(const Ptr<ScaleLayer>&) { return false; }
+void Layer::unsetAttached()
+{
+    setActivation(Ptr<ActivationLayer>());
+    setBatchNorm(Ptr<BatchNormLayer>());
+    setScale(Ptr<ScaleLayer>());
+}
 
 template <typename T>
 static void vecToPVec(const std::vector<T> &v, std::vector<T*> &pv)
